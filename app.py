@@ -1,0 +1,491 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime, date
+import io
+import json
+
+# ==============================================================================
+# 1. CONFIGURAÇÃO DA PÁGINA & TEMA
+# ==============================================================================
+st.set_page_config(
+    page_title="RECOVERTY — Gestão Financeira",
+    page_icon="🏥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Estilização CSS personalizada (Visual SaaS Moderno)
+st.markdown("""
+    <style>
+    .main-header {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #0F172A;
+        margin-bottom: 0px;
+    }
+    .sub-header {
+        font-size: 1rem;
+        color: #64748B;
+        margin-bottom: 20px;
+    }
+    .metric-card {
+        background-color: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 10px;
+        padding: 18px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .metric-title {
+        font-size: 0.85rem;
+        color: #64748B;
+        font-weight: 600;
+        text-transform: uppercase;
+        margin-bottom: 5px;
+    }
+    .metric-value {
+        font-size: 1.6rem;
+        font-weight: 700;
+        color: #0F172A;
+    }
+    .preview-card {
+        background-color: #F8FAFC;
+        border-left: 4px solid #2563EB;
+        padding: 15px;
+        border-radius: 6px;
+        margin-top: 10px;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# 2. CÁLCULOS FINANCEIROS (CENTRALIZADO)
+# ==============================================================================
+def to_decimal(val) -> Decimal:
+    if val is None or val == "":
+        return Decimal("0.00")
+    if isinstance(val, Decimal):
+        return val
+    try:
+        if isinstance(val, str):
+            clean_str = val.replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
+            return Decimal(clean_str)
+        return Decimal(str(val))
+    except Exception:
+        return Decimal("0.00")
+
+def quantize_money(amount: Decimal) -> Decimal:
+    return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+def calcular_lancamento(
+    valor_bruto,
+    taxa_pagamento_pct,
+    taxa_pagamento_fixa=0,
+    material_clinica=0,
+    material_dra=0,
+    aliquota_imposto_pct=0,
+    custo_nota_fiscal=0,
+    percentual_repasse_dra=50
+):
+    v_bruto = to_decimal(valor_bruto)
+    taxa_pct = to_decimal(taxa_pagamento_pct)
+    taxa_fixa = to_decimal(taxa_pagamento_fixa)
+    mat_clinica = to_decimal(material_clinica)
+    mat_dra = to_decimal(material_dra)
+    imposto_pct = to_decimal(aliquota_imposto_pct)
+    c_nota = to_decimal(custo_nota_fiscal)
+    repasse_pct = to_decimal(percentual_repasse_dra)
+
+    # Taxa de Pagamento
+    valor_taxa_pag = quantize_money((v_bruto * (taxa_pct / Decimal("100"))) + taxa_fixa)
+    valor_apos_taxa = quantize_money(v_bruto - valor_taxa_pag)
+
+    # Impostos (caso aplicável por alíquota)
+    valor_imposto = quantize_money(v_bruto * (imposto_pct / Decimal("100")))
+    cost_nf_total = c_nota if c_nota > 0 else valor_imposto
+
+    # Lucro Líquido
+    lucro_liquido = quantize_money(
+        valor_apos_taxa - mat_clinica - mat_dra - cost_nf_total
+    )
+
+    # Divisão/Repasse
+    repasse_dra_base = quantize_money(lucro_liquido * (repasse_pct / Decimal("100")))
+    valor_final_dra = quantize_money(repasse_dra_base + mat_dra)
+    valor_repassado_clinica = quantize_money(lucro_liquido - repasse_dra_base)
+    valor_final_clinica_com_material = quantize_money(valor_repassado_clinica + mat_clinica)
+
+    return {
+        "valor_bruto": float(v_bruto),
+        "taxa_pagamento_pct": float(taxa_pct),
+        "valor_taxa_pagamento": float(valor_taxa_pag),
+        "valor_apos_taxa": float(valor_apos_taxa),
+        "material_clinica": float(mat_clinica),
+        "material_dra": float(mat_dra),
+        "aliquota_imposto_pct": float(imposto_pct),
+        "custo_nota_fiscal": float(cost_nf_total),
+        "lucro_liquido": float(lucro_liquido),
+        "valor_repassado_clinica": float(valor_repassado_clinica),
+        "valor_final_dra": float(valor_final_dra),
+        "valor_final_clinica": float(valor_repassado_clinica),
+        "valor_final_clinica_com_material": float(valor_final_clinica_com_material),
+    }
+
+# ==============================================================================
+# 3. GESTÃO DE ESTADO & SERVIÇOS DE DADOS
+# ==============================================================================
+def init_session_state():
+    if "param_procedimentos" not in st.session_state:
+        st.session_state.param_procedimentos = pd.DataFrame([
+            {"Procedimento": "BIOIMPEDÂNCIA", "Custo Material": 150.0},
+            {"Procedimento": "PROTOCOLO DE SOROTERAPIA - MÉDICA", "Custo Material": 100.0},
+            {"Procedimento": "RETORNO BOTOX - ESTÉTICA", "Custo Material": 200.0},
+            {"Procedimento": "CONSULTA - ESTÉTICA", "Custo Material": 0.0},
+        ])
+
+    if "param_taxas" not in st.session_state:
+        st.session_state.param_taxas = pd.DataFrame([
+            {"Forma de Pagamento": "PIX", "Taxa (%)": 0.0},
+            {"Forma de Pagamento": "Boleto", "Taxa (%)": 0.0},
+            {"Forma de Pagamento": "Visa Débito", "Taxa (%)": 0.79},
+            {"Forma de Pagamento": "Visa Credito 1x", "Taxa (%)": 2.79},
+            {"Forma de Pagamento": "Visa Credito 2x", "Taxa (%)": 4.08},
+            {"Forma de Pagamento": "Visa Credito 12x", "Taxa (%)": 9.56},
+            {"Forma de Pagamento": "Master Credito 1x", "Taxa (%)": 2.79},
+        ])
+
+    if "param_impostos" not in st.session_state:
+        st.session_state.param_impostos = pd.DataFrame([
+            {"Tipo": "IVA", "Taxa (%)": 10.0},
+            {"Tipo": "ICBS", "Taxa (%)": 20.0},
+            {"Tipo": "CB", "Taxa (%)": 30.0},
+        ])
+
+    if "param_origens" not in st.session_state:
+        st.session_state.param_origens = ["Particular", "Instagram", "Indicação", "Google", "Médico", "Convênio", "Outros"]
+
+    if "param_profissionais" not in st.session_state:
+        st.session_state.param_profissionais = ["DRA. DENISSE", "DR. GABRIEL", "RECOVERY"]
+
+    if "lancamentos" not in st.session_state:
+        # Dados de demonstração baseados na planilha
+        st.session_state.lancamentos = pd.DataFrame([
+            {
+                "ID": "LAN-001",
+                "DATA": "2026-08-18",
+                "PACIENTE": "João Silva",
+                "PROFISSIONAL": "DRA. DENISSE",
+                "ORIGEM": "Instagram",
+                "PROCEDIMENTO": "RETORNO BOTOX - ESTÉTICA",
+                "Valor Bruto (R$)": 5000.0,
+                "Forma de Pagamento": "Visa Credito 12x",
+                "Taxa de Pagamento (%)": 9.56,
+                "Valor da Taxa de Pagamento (R$)": 478.0,
+                "Valor após Taxa de Pagamento (R$)": 4522.0,
+                "Material da clínica (R$)": 200.0,
+                "Material da Dra. Denisse (R$)": 0.0,
+                "Tipo de Imposto": "IVA",
+                "Custo Nota Fiscal (R$)": 500.0,
+                "Lucro Líquido (R$)": 3822.0,
+                "Valor Repasse Clínica (R$)": 1911.0,
+                "Valor Final Dra. Denisse (R$)": 1911.0,
+                "Valor Final Clínica/Com Material (R$)": 2111.0
+            }
+        ])
+
+init_session_state()
+
+# ==============================================================================
+# 4. FORMATAÇÕES AUXILIARES
+# ==============================================================================
+def fmt_brl(val) -> str:
+    return f"R$ {val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def fmt_pct(val) -> str:
+    return f"{val:.2f}%".replace(".", ",")
+
+# ==============================================================================
+# 5. ESTRUTURA DE NAVEGAÇÃO LATERAL
+# ==============================================================================
+st.sidebar.title("RECOVERTY")
+st.sidebar.caption("Gestão Financeira e Repasses")
+menu = st.sidebar.radio(
+    "Navegação",
+    ["📊 Dashboard", "➕ Novo Lançamento", "📋 Lançamentos", "⚙️ Parâmetros", "📈 Relatórios"]
+)
+
+# ==============================================================================
+# MODULO 1: DASHBOARD
+# ==============================================================================
+if menu == "📊 Dashboard":
+    st.markdown('<div class="main-header">Dashboard Financeiro</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Acompanhamento consolidado de faturamento, repasses e lucro.</div>', unsafe_allow_html=True)
+
+    df_lan = st.session_state.lancamentos.copy()
+
+    # Filtros
+    with st.expander("🔍 Filtros de Consulta", expanded=True):
+        f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+        with f_col1:
+            prof_opts = ["Todos"] + st.session_state.param_profissionais
+            sel_prof = st.selectbox("Profissional", prof_opts)
+        with f_col2:
+            proc_opts = ["Todos"] + list(st.session_state.param_procedimentos["Procedimento"].unique())
+            sel_proc = st.selectbox("Procedimento", proc_opts)
+        with f_col3:
+            orig_opts = ["Todas"] + st.session_state.param_origens
+            sel_orig = st.selectbox("Origem", orig_opts)
+        with f_col4:
+            pag_opts = ["Todas"] + list(st.session_state.param_taxas["Forma de Pagamento"].unique())
+            sel_pag = st.selectbox("Forma de Pagamento", pag_opts)
+
+    # Aplicação dos Filtros
+    if not df_lan.empty:
+        if sel_prof != "Todos":
+            df_lan = df_lan[df_lan["PROFISSIONAL"] == sel_prof]
+        if sel_proc != "Todos":
+            df_lan = df_lan[df_lan["PROCEDIMENTO"] == sel_proc]
+        if sel_orig != "Todas":
+            df_lan = df_lan[df_lan["ORIGEM"] == sel_orig]
+        if sel_pag != "Todas":
+            df_lan = df_lan[df_lan["Forma de Pagamento"] == sel_pag]
+
+    # Indicadores
+    v_bruto_tot = df_lan["Valor Bruto (R$)"].sum() if not df_lan.empty else 0.0
+    v_taxas_tot = df_lan["Valor da Taxa de Pagamento (R$)"].sum() if not df_lan.empty else 0.0
+    v_mat_clin = df_lan["Material da clínica (R$)"].sum() if not df_lan.empty else 0.0
+    v_mat_dra = df_lan["Material da Dra. Denisse (R$)"].sum() if not df_lan.empty else 0.0
+    v_impostos = df_lan["Custo Nota Fiscal (R$)"].sum() if not df_lan.empty else 0.0
+    v_lucro_liq = df_lan["Lucro Líquido (R$)"].sum() if not df_lan.empty else 0.0
+    v_final_dra = df_lan["Valor Final Dra. Denisse (R$)"].sum() if not df_lan.empty else 0.0
+    v_final_clin = df_lan["Valor Final Clínica/Com Material (R$)"].sum() if not df_lan.empty else 0.0
+
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    kpi1.metric("Faturamento Bruto", fmt_brl(v_bruto_tot))
+    kpi2.metric("Taxas Pagamento", fmt_brl(v_taxas_tot))
+    kpi3.metric("Impostos/Notas", fmt_brl(v_impostos))
+    kpi4.metric("Materiais Totais", fmt_brl(v_mat_clin + v_mat_dra))
+    kpi5.metric("Lucro Líquido", fmt_brl(v_lucro_liq))
+
+    st.markdown("---")
+    r_col1, r_col2 = st.columns(2)
+    with r_col1:
+        st.info(f"### Repasse Dra. Denise: **{fmt_brl(v_final_dra)}**")
+    with r_col2:
+        st.success(f"### Total Clínica (c/ Material): **{fmt_brl(v_final_clin)}**")
+
+    # Gráficos Interativos
+    if not df_lan.empty:
+        g_col1, g_col2 = st.columns(2)
+        with g_col1:
+            st.subheader("Distribuição do Resultado")
+            df_dist = pd.DataFrame({
+                "Categoria": ["Repasse Dra.", "Clínica (c/ Mat)", "Impostos", "Taxas Cartão"],
+                "Valor": [v_final_dra, v_final_clin, v_impostos, v_taxas_tot]
+            })
+            fig_pie = px.pie(df_dist, names="Categoria", values="Valor", hole=0.4, color_discrete_sequence=px.colors.qualitative.Set2)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with g_col2:
+            st.subheader("Faturamento por Procedimento")
+            df_proc_f = df_lan.groupby("PROCEDIMENTO")["Valor Bruto (R$)"].sum().reset_index()
+            fig_bar = px.bar(df_proc_f, x="PROCEDIMENTO", y="Valor Bruto (R$)", text_auto=True, color="Valor Bruto (R$)")
+            st.plotly_chart(fig_bar, use_container_width=True)
+    else:
+        st.warning("Nenhum lançamento encontrado para os filtros selecionados.")
+
+# ==============================================================================
+# MODULO 2: NOVO LANÇAMENTO
+# ==============================================================================
+elif menu == "➕ Novo Lançamento":
+    st.markdown('<div class="main-header">Novo Lançamento</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Registre um procedimento e obtenha a prévia do cálculo imediata.</div>', unsafe_allow_html=True)
+
+    with st.form("form_novo_lancamento", clear_on_submit=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            data_atend = st.date_input("Data do Atendimento", value=date.today())
+            paciente = st.text_input("Nome do Paciente *", placeholder="Ex: Maria Oliveira")
+            profissional = st.selectbox("Profissional", st.session_state.param_profissionais)
+        
+        with col2:
+            origem = st.selectbox("Origem do Paciente", st.session_state.param_origens)
+            procedimentos_lista = list(st.session_state.param_procedimentos["Procedimento"].unique())
+            procedimento_sel = st.selectbox("Procedimento *", procedimentos_lista)
+            valor_bruto_inp = st.number_input("Valor Bruto (R$) *", min_value=0.0, step=50.0, value=500.0)
+
+        with col3:
+            pagamentos_lista = list(st.session_state.param_taxas["Forma de Pagamento"].unique())
+            forma_pag_sel = st.selectbox("Forma de Pagamento *", pagamentos_lista)
+            
+            # Buscar Material Clínica automaticamente dos parâmetros
+            mat_default = st.session_state.param_procedimentos.loc[
+                st.session_state.param_procedimentos["Procedimento"] == procedimento_sel, "Custo Material"
+            ].values
+            mat_clinica_def = float(mat_default[0]) if len(mat_default) > 0 and pd.notnull(mat_default[0]) else 0.0
+
+            material_clinica_inp = st.number_input("Material da Clínica (R$)", min_value=0.0, value=mat_clinica_def)
+            material_dra_inp = st.number_input("Material da Dra. Denise (R$)", min_value=0.0, value=0.0)
+            imposto_sel = st.selectbox("Imposto Aplicável", ["Nenhum"] + list(st.session_state.param_impostos["Tipo"].unique()))
+
+        # Cálculo em tempo real da Prévia
+        taxa_pct_lookup = st.session_state.param_taxas.loc[
+            st.session_state.param_taxas["Forma de Pagamento"] == forma_pag_sel, "Taxa (%)"
+        ].values
+        taxa_pct_val = float(taxa_pct_lookup[0]) if len(taxa_pct_lookup) > 0 else 0.0
+
+        imposto_pct_val = 0.0
+        if imposto_sel != "Nenhum":
+            imp_lookup = st.session_state.param_impostos.loc[
+                st.session_state.param_impostos["Tipo"] == imposto_sel, "Taxa (%)"
+            ].values
+            imposto_pct_val = float(imp_lookup[0]) if len(imp_lookup) > 0 else 0.0
+
+        calc = calcular_lancamento(
+            valor_bruto=valor_bruto_inp,
+            taxa_pagamento_pct=taxa_pct_val,
+            material_clinica=material_clinica_inp,
+            material_dra=material_dra_inp,
+            aliquota_imposto_pct=imposto_pct_val
+        )
+
+        # Prévia Visual
+        st.markdown('<div class="preview-card">', unsafe_allow_html=True)
+        st.markdown("### 📋 Prévia dos Cálculos")
+        p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+        p_col1.write(f"**Taxa Maquininha ({taxa_pct_val:.2f}%):** {fmt_brl(calc['valor_taxa_pagamento'])}")
+        p_col2.write(f"**Valor pós Taxa:** {fmt_brl(calc['valor_apos_taxa'])}")
+        p_col3.write(f"**Custo Nota/Imposto:** {fmt_brl(calc['custo_nota_fiscal'])}")
+        p_col4.write(f"**Lucro Líquido:** {fmt_brl(calc['lucro_liquido'])}")
+        
+        pr_col1, pr_col2 = st.columns(2)
+        pr_col1.write(f"👉 **Repasse Profissional:** {fmt_brl(calc['valor_final_dra'])}")
+        pr_col2.write(f"👉 **Clínica c/ Material:** {fmt_brl(calc['valor_final_clinica_com_material'])}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        submitted = st.form_submit_button("💾 Salvar Lançamento", use_container_width=True)
+        if submitted:
+            if not paciente:
+                st.error("Por favor, informe o nome do paciente.")
+            elif valor_bruto_inp <= 0:
+                st.error("O valor bruto deve ser maior que zero.")
+            else:
+                novo_id = f"LAN-{len(st.session_state.lancamentos) + 1:03d}"
+                novo_registro = {
+                    "ID": novo_id,
+                    "DATA": str(data_atend),
+                    "PACIENTE": paciente,
+                    "PROFISSIONAL": profissional,
+                    "ORIGEM": origem,
+                    "PROCEDIMENTO": procedimento_sel,
+                    "Valor Bruto (R$)": calc["valor_bruto"],
+                    "Forma de Pagamento": forma_pag_sel,
+                    "Taxa de Pagamento (%)": calc["taxa_pagamento_pct"],
+                    "Valor da Taxa de Pagamento (R$)": calc["valor_taxa_pagamento"],
+                    "Valor após Taxa de Pagamento (R$)": calc["valor_apos_taxa"],
+                    "Material da clínica (R$)": calc["material_clinica"],
+                    "Material da Dra. Denise (R$)": calc["material_dra"],
+                    "Tipo de Imposto": imposto_sel,
+                    "Custo Nota Fiscal (R$)": calc["custo_nota_fiscal"],
+                    "Lucro Líquido (R$)": calc["lucro_liquido"],
+                    "Valor Repasse Clínica (R$)": calc["valor_repassado_clinica"],
+                    "Valor Final Dra. Denise (R$)": calc["valor_final_dra"],
+                    "Valor Final Clínica/Com Material (R$)": calc["valor_final_clinica_com_material"]
+                }
+                st.session_state.lancamentos = pd.concat([
+                    st.session_state.lancamentos, pd.DataFrame([novo_registro])
+                ], ignore_index=True)
+                st.success(f"Lançamento {novo_id} registrado com sucesso!")
+
+# ==============================================================================
+# MODULO 3: LANÇAMENTOS
+# ==============================================================================
+elif menu == "📋 Lançamentos":
+    st.markdown('<div class="main-header">Registros de Lançamentos</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Visualização completa, consulta e exclusão de atendimentos.</div>', unsafe_allow_html=True)
+
+    df_lan = st.session_state.lancamentos
+
+    if not df_lan.empty:
+        st.dataframe(df_lan, use_container_width=True, hide_index=True)
+        
+        st.markdown("---")
+        st.subheader("🗑️ Excluir Registro")
+        lan_ids = list(df_lan["ID"].unique())
+        sel_del = st.selectbox("Selecione o ID do Lançamento para remover:", lan_ids)
+        if st.button("Confirmar Exclusão", type="primary"):
+            st.session_state.lancamentos = df_lan[df_lan["ID"] != sel_del].reset_index(drop=True)
+            st.success(f"Lançamento {sel_del} excluído!")
+            st.rerun()
+    else:
+        st.info("Nenhum lançamento cadastrado.")
+
+# ==============================================================================
+# MODULO 4: PARÂMETROS
+# ==============================================================================
+elif menu == "⚙️ Parâmetros":
+    st.markdown('<div class="main-header">Parâmetros do Sistema</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Edite taxas, custos e procedimentos sem precisar alterar o código.</div>', unsafe_allow_html=True)
+
+    tab1, tab2, tab3 = st.tabs(["Procedimentos & Materiais", "Taxas de Pagamento", "Impostos"])
+
+    with tab1:
+        st.subheader("Procedimentos Cadastrados")
+        df_proc_ed = st.data_editor(st.session_state.param_procedimentos, num_rows="dynamic", use_container_width=True)
+        if st.button("Salvar Alterações em Procedimentos"):
+            st.session_state.param_procedimentos = df_proc_ed
+            st.success("Procedimentos atualizados!")
+
+    with tab2:
+        st.subheader("Taxas de Formas de Pagamento")
+        df_taxas_ed = st.data_editor(st.session_state.param_taxas, num_rows="dynamic", use_container_width=True)
+        if st.button("Salvar Alterações em Taxas"):
+            st.session_state.param_taxas = df_taxas_ed
+            st.success("Taxas atualizadas!")
+
+    with tab3:
+        st.subheader("Configuração de Impostos")
+        df_imp_ed = st.data_editor(st.session_state.param_impostos, num_rows="dynamic", use_container_width=True)
+        if st.button("Salvar Alterações em Impostos"):
+            st.session_state.param_impostos = df_imp_ed
+            st.success("Impostos atualizados!")
+
+# ==============================================================================
+# MODULO 5: RELATÓRIOS
+# ==============================================================================
+elif menu == "📈 Relatórios":
+    st.markdown('<div class="main-header">Relatórios Financeiros</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Exporte dados consolidados para Excel ou CSV.</div>', unsafe_allow_html=True)
+
+    df_lan = st.session_state.lancamentos
+
+    if not df_lan.empty:
+        col_exp1, col_exp2 = st.columns(2)
+        
+        # Exportar CSV
+        csv_data = df_lan.to_csv(index=False).encode('utf-8')
+        col_exp1.download_button(
+            label="📥 Baixar Relatório em CSV",
+            data=csv_data,
+            file_name=f"relatorio_recoverty_{date.today()}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+        # Exportar Excel
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_lan.to_excel(writer, index=False, sheet_name='Lançamentos')
+        excel_data = output.getvalue()
+
+        col_exp2.download_button(
+            label="📊 Baixar Relatório em Excel",
+            data=excel_data,
+            file_name=f"relatorio_recoverty_{date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.info("Não há dados para exportação.")
