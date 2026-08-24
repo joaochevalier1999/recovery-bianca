@@ -4,8 +4,10 @@ import plotly.express as px
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, date, time
 import io
+import json
 
-# Tentar importar gspread para integração direta com Google Sheets
+# Tentar importar gspread e google.oauth2
+HAS_GSPREAD = False
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -17,7 +19,7 @@ except ImportError:
 # 1. CONFIGURAÇÃO DA PÁGINA & TEMA
 # ==============================================================================
 st.set_page_config(
-    page_title="RECOVERTY — Portal de Gestão e Agendamentos",
+    page_title="RECOVERY — Portal de Gestão e Agendamentos",
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -54,60 +56,68 @@ st.markdown("""
         display: inline-block;
         margin-bottom: 15px;
     }
-    .status-ativo {
-        color: #16A34A;
-        font-weight: bold;
-    }
-    .status-excluido {
-        color: #DC2626;
-        font-weight: bold;
-    }
     </style>
 """, unsafe_allow_html=True)
 
-# ID da Planilha do Google Sheets fornecida
 SPREADSHEET_ID = "1aygRSlsXbsafrF-osiOq9S_BhNaIIDfKU4CbtVoemBA"
 
 # ==============================================================================
-# 2. INTEGRAÇÃO GOOGLE SHEETS
+# 2. INTEGRAÇÃO ROBUSTA COM GOOGLE SHEETS
 # ==============================================================================
 def get_gspread_client():
-    """Conecta ao Google Sheets usando as credenciais cadastradas nos Secrets do Streamlit."""
+    """Obtém o cliente gspread autenticado usando os secrets do Streamlit."""
     if not HAS_GSPREAD:
-        return None
+        return None, "Biblioteca 'gspread' não encontrada no requirements.txt."
+    
+    if "gcp_service_account" not in st.secrets:
+        return None, "Configuração [gcp_service_account] não encontrada em Secrets do Streamlit."
+
     try:
-        if "gcp_service_account" in st.secrets:
-            creds_dict = dict(st.secrets["gcp_service_account"])
-            scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-            credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-            return gspread.authorize(credentials)
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        # Garante que a private_key não perca as quebras de linha \\n
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(credentials)
+        return client, None
     except Exception as e:
-        return None
-    return None
+        return None, f"Erro de Autenticação Google: {str(e)}"
 
 def sync_to_google_sheets(df_lancamentos):
-    """Envia o DataFrame atualizado de Lançamentos para a planilha do Google Sheets."""
-    client = get_gspread_client()
-    if client:
+    """Envia o DataFrame completo de Lançamentos para a aba 'Lançamentos' do Google Sheets."""
+    client, err_msg = get_gspread_client()
+    if err_msg:
+        st.error(f"❌ Falha de Conexão com Google Sheets: {err_msg}")
+        return False
+
+    try:
+        sh = client.open_by_key(SPREADSHEET_ID)
+        
+        # Tenta obter a aba 'Lançamentos' ou cria caso não exista
         try:
-            sh = client.open_by_key(SPREADSHEET_ID)
-            try:
-                ws = sh.worksheet("Lançamentos")
-            except Exception:
-                ws = sh.add_worksheet(title="Lançamentos", rows="1000", cols="30")
-            
-            ws.clear()
-            # Converte valores datetime/date para string para exportação simples
-            df_export = df_lancamentos.copy()
-            for col in df_export.columns:
-                df_export[col] = df_export[col].astype(str)
-            
-            ws.update([df_export.columns.values.tolist()] + df_export.values.tolist())
-            return True
-        except Exception as e:
-            st.sidebar.warning(f"Aviso de Sincronização Google Sheets: {e}")
-            return False
-    return False
+            ws = sh.worksheet("Lançamentos")
+        except Exception:
+            ws = sh.add_worksheet(title="Lançamentos", rows="1000", cols="30")
+
+        # Limpa o conteúdo existente para regravar o histórico sincronizado
+        ws.clear()
+
+        # Trata nulos e converte todo o DataFrame para lista de strings para evitar erro de serialização
+        df_clean = df_lancamentos.copy().fillna("")
+        for col in df_clean.columns:
+            df_clean[col] = df_clean[col].astype(str)
+
+        valores = [df_clean.columns.tolist()] + df_clean.values.tolist()
+        ws.update("A1", valores)
+        return True
+    except Exception as e:
+        st.error(f"❌ Erro ao gravar dados na planilha Google Sheets: {str(e)}")
+        return False
 
 # ==============================================================================
 # 3. CÁLCULOS FINANCEIROS (CENTRALIZADOS)
@@ -157,7 +167,7 @@ def calcular_lancamento(
     valor_imposto = quantize_money(v_bruto * (imposto_pct / Decimal("100")))
     cost_nf_total = c_nota if c_nota > 0 else valor_imposto
 
-    # Material Total Clínica (padrão + adicional)
+    # Material Total Clínica
     mat_clinica_total = quantize_money(mat_clinica + mat_add)
 
     # Lucro Líquido
@@ -355,7 +365,7 @@ if check_login():
     if user["acesso_financeiro"]:
         menu_options = ["📅 Agendamentos", "📊 Dashboard", "➕ Novo Lançamento", "📋 Lançamentos", "⚙️ Parâmetros", "📈 Relatórios"]
     else:
-        menu_options = ["📅 Agendamentos"] # Secretária acessa apenas Agendamentos
+        menu_options = ["📅 Agendamentos"]
 
     menu = st.sidebar.radio("Navegação", menu_options)
 
@@ -415,13 +425,12 @@ if check_login():
                         st.rerun()
 
     # ==========================================================================
-    # MODULO: DASHBOARD (Financeiro - Considera apenas lançamentos ATIVOS)
+    # MODULO: DASHBOARD (Financeiro)
     # ==========================================================================
     elif menu == "📊 Dashboard":
         st.markdown('<div class="main-header">Dashboard Financeiro</div>', unsafe_allow_html=True)
         st.markdown('<div class="sub-header">Visão consolidada dos lançamentos ativos.</div>', unsafe_allow_html=True)
 
-        # Filtra apenas lançamentos ATIVOS
         df_lan_raw = st.session_state.lancamentos.copy()
         df_lan = df_lan_raw[df_lan_raw["STATUS"] == "ATIVO"] if "STATUS" in df_lan_raw.columns else df_lan_raw
 
@@ -442,15 +451,15 @@ if check_login():
             if sel_orig != "Todas": df_lan = df_lan[df_lan["ORIGEM"] == sel_orig]
             if sel_pag != "Todas": df_lan = df_lan[df_lan["Forma de Pagamento"] == sel_pag]
 
-        v_bruto_tot = df_lan["Valor Bruto (R$)"].sum() if not df_lan.empty else 0.0
-        v_taxas_tot = df_lan["Valor da Taxa de Pagamento (R$)"].sum() if not df_lan.empty else 0.0
-        v_mat_clin = df_lan["Material da clínica (R$)"].sum() if not df_lan.empty else 0.0
-        v_mat_add = df_lan["Custo Adicional Material (R$)"].sum() if not df_lan.empty else 0.0
-        v_mat_dra = df_lan["Material da Dra. Denise (R$)"].sum() if not df_lan.empty else 0.0
-        v_impostos = df_lan["Custo Nota Fiscal (R$)"].sum() if not df_lan.empty else 0.0
-        v_lucro_liq = df_lan["Lucro Líquido (R$)"].sum() if not df_lan.empty else 0.0
-        v_final_dra = df_lan["Valor Final Dra. Denise (R$)"].sum() if not df_lan.empty else 0.0
-        v_final_clin = df_lan["Valor Final Clínica/Com Material (R$)"].sum() if not df_lan.empty else 0.0
+        v_bruto_tot = float(pd.to_numeric(df_lan["Valor Bruto (R$)"].values, errors='coerce').sum()) if not df_lan.empty else 0.0
+        v_taxas_tot = float(pd.to_numeric(df_lan["Valor da Taxa de Pagamento (R$)"].values, errors='coerce').sum()) if not df_lan.empty else 0.0
+        v_mat_clin = float(pd.to_numeric(df_lan["Material da clínica (R$)"].values, errors='coerce').sum()) if not df_lan.empty else 0.0
+        v_mat_add = float(pd.to_numeric(df_lan["Custo Adicional Material (R$)"].values, errors='coerce').sum()) if not df_lan.empty else 0.0
+        v_mat_dra = float(pd.to_numeric(df_lan["Material da Dra. Denise (R$)"].values, errors='coerce').sum()) if not df_lan.empty else 0.0
+        v_impostos = float(pd.to_numeric(df_lan["Custo Nota Fiscal (R$)"].values, errors='coerce').sum()) if not df_lan.empty else 0.0
+        v_lucro_liq = float(pd.to_numeric(df_lan["Lucro Líquido (R$)"].values, errors='coerce').sum()) if not df_lan.empty else 0.0
+        v_final_dra = float(pd.to_numeric(df_lan["Valor Final Dra. Denise (R$)"].values, errors='coerce').sum()) if not df_lan.empty else 0.0
+        v_final_clin = float(pd.to_numeric(df_lan["Valor Final Clínica/Com Material (R$)"].values, errors='coerce').sum()) if not df_lan.empty else 0.0
 
         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
         kpi1.metric("Faturamento Bruto", fmt_brl(v_bruto_tot))
@@ -482,7 +491,7 @@ if check_login():
                 st.plotly_chart(fig_bar, use_container_width=True)
 
     # ==========================================================================
-    # MODULO: NOVO LANÇAMENTO (Sincroniza com Google Sheets)
+    # MODULO: NOVO LANÇAMENTO (Sincronização Ativa com Google Sheets)
     # ==========================================================================
     elif menu == "➕ Novo Lançamento":
         st.markdown('<div class="main-header">Novo Lançamento Financeiro</div>', unsafe_allow_html=True)
@@ -552,7 +561,7 @@ if check_login():
             pr_col2.write(f"👉 **Clínica c/ Material Total:** {fmt_brl(calc['valor_final_clinica_com_material'])}")
             st.markdown('</div>', unsafe_allow_html=True)
 
-            if st.form_submit_button("💾 Salvar Lançamento", use_container_width=True):
+            if st.form_submit_button("💾 Salvar e Enviar para Planilha", use_container_width=True):
                 if not paciente:
                     st.error("Por favor, informe o nome do paciente.")
                 elif valor_bruto_inp <= 0:
@@ -595,11 +604,10 @@ if check_login():
                     ], ignore_index=True)
 
                     # Enviar para o Google Sheets
-                    synced = sync_to_google_sheets(st.session_state.lancamentos)
-                    if synced:
-                        st.success(f"Lançamento {novo_id} salvo e registrado no Google Sheets!")
-                    else:
-                        st.success(f"Lançamento {novo_id} salvo localmente!")
+                    with st.spinner("Gravando na planilha do Google Sheets..."):
+                        synced = sync_to_google_sheets(st.session_state.lancamentos)
+                        if synced:
+                            st.success(f"✅ Lançamento {novo_id} gravado com SUCESSO na planilha Google Sheets!")
 
     # ==========================================================================
     # MODULO: LANÇAMENTOS (Com Histórico e Soft Delete para Auditoria)
@@ -623,31 +631,31 @@ if check_login():
             if user["pode_excluir_alterar"]:
                 st.subheader("🗑️ Cancelar / Marcar como Excluído")
                 
-                # Lista apenas os ativos para exclusão
                 lan_ativos = list(df_lan[df_lan["STATUS"] == "ATIVO"]["ID"].unique())
                 
                 if lan_ativos:
                     sel_del = st.selectbox("Selecione o ID do Lançamento para marcar como EXCLUÍDO:", lan_ativos)
-                    if st.button("Confirmar Marcação de Exclusão", type="primary"):
+                    if st.button("Confirmar Exclusão e Atualizar Planilha", type="primary"):
                         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         
-                        # Atualiza o status e grava o histórico em vez de apagar a linha
+                        # Atualiza o status e salva o histórico em vez de apagar
                         st.session_state.lancamentos.loc[
                             st.session_state.lancamentos["ID"] == sel_del, ["STATUS", "EXCLUIDO EM", "USUARIO EXCLUSAO"]
                         ] = ["EXCLUÍDO", now_str, user["nome"]]
                         
-                        sync_to_google_sheets(st.session_state.lancamentos)
-                        st.success(f"Lançamento {sel_del} marcado como EXCLUÍDO com histórico mantido!")
-                        st.rerun()
+                        with st.spinner("Atualizando histórico na planilha..."):
+                            sync_to_google_sheets(st.session_state.lancamentos)
+                            st.success(f"Lançamento {sel_del} marcado como EXCLUÍDO e gravado na planilha!")
+                            st.rerun()
                 else:
                     st.info("Não há lançamentos ativos para exclusão.")
             else:
-                st.warning("⚠️ Seu perfil (Auxiliar Júnior) possui permissão apenas para visualização. Alterações de status estão bloqueadas.")
+                st.warning("⚠️ Seu perfil (Auxiliar Júnior) possui permissão apenas para visualização.")
         else:
             st.info("Nenhum lançamento cadastrado.")
 
     # ==========================================================================
-    # MODULO: PARÂMETROS (Bloqueio para Júnior)
+    # MODULO: PARÂMETROS
     # ==========================================================================
     elif menu == "⚙️ Parâmetros":
         st.markdown('<div class="main-header">Parâmetros do Sistema</div>', unsafe_allow_html=True)
@@ -685,7 +693,7 @@ if check_login():
     # ==========================================================================
     elif menu == "📈 Relatórios":
         st.markdown('<div class="main-header">Relatórios Financeiros</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sub-header">Exportação consolidada dos dados completos (incluindo auditoria).</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub-header">Exportação consolidada dos dados completos.</div>', unsafe_allow_html=True)
 
         df_lan = st.session_state.lancamentos
         if not df_lan.empty:
