@@ -4,7 +4,6 @@ import plotly.express as px
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, date, time
 import io
-import json
 
 # Tentar importar gspread e google.oauth2
 HAS_GSPREAD = False
@@ -19,7 +18,7 @@ except ImportError:
 # 1. CONFIGURAÇÃO DA PÁGINA & TEMA
 # ==============================================================================
 st.set_page_config(
-    page_title="RECOVERY — Portal de Gestão e Agendamentos",
+    page_title="RECOVERY — Gestão Financeira",
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -46,6 +45,13 @@ st.markdown("""
         border-radius: 6px;
         margin-top: 10px;
     }
+    .status-card {
+        background-color: #F1F5F9;
+        border: 1px solid #CBD5E1;
+        padding: 12px 18px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+    }
     .user-badge {
         background-color: #E2E8F0;
         padding: 6px 12px;
@@ -62,19 +68,19 @@ st.markdown("""
 SPREADSHEET_ID = "1aygRSlsXbsafrF-osiOq9S_BhNaIIDfKU4CbtVoemBA"
 
 # ==============================================================================
-# 2. INTEGRAÇÃO ROBUSTA COM GOOGLE SHEETS
+# 2. INTEGRAÇÃO ROBUSTA COM GOOGLE SHEETS E DIAGNÓSTICO
 # ==============================================================================
 def get_gspread_client():
     """Obtém o cliente gspread autenticado usando os secrets do Streamlit."""
     if not HAS_GSPREAD:
-        return None, "Biblioteca 'gspread' não encontrada no requirements.txt."
+        return None, "Biblioteca 'gspread' não instalada no requirements.txt."
     
     if "gcp_service_account" not in st.secrets:
         return None, "Configuração [gcp_service_account] não encontrada em Secrets do Streamlit."
 
     try:
         creds_dict = dict(st.secrets["gcp_service_account"])
-        # Garante que a private_key não perca as quebras de linha \\n
+        # Garante tratamento para quebras de linha na private_key
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
@@ -86,7 +92,20 @@ def get_gspread_client():
         client = gspread.authorize(credentials)
         return client, None
     except Exception as e:
-        return None, f"Erro de Autenticação Google: {str(e)}"
+        return None, f"Erro de Autenticação nas Credenciais: {str(e)}"
+
+def testar_conexao_google_sheets():
+    """Testa a conexão e o acesso de escrita na planilha para exibir o diagnóstico no Dashboard."""
+    client, err_msg = get_gspread_client()
+    if err_msg:
+        return False, err_msg, None
+    
+    try:
+        sh = client.open_by_key(SPREADSHEET_ID)
+        email_bot = st.secrets["gcp_service_account"].get("client_email", "Email N/A")
+        return True, f"Conectado com SUCESSO à planilha '{sh.title}'", email_bot
+    except Exception as e:
+        return False, f"Erro ao acessar a planilha: {str(e)}", None
 
 def sync_to_google_sheets(df_lancamentos):
     """Envia o DataFrame completo de Lançamentos para a aba 'Lançamentos' do Google Sheets."""
@@ -98,16 +117,15 @@ def sync_to_google_sheets(df_lancamentos):
     try:
         sh = client.open_by_key(SPREADSHEET_ID)
         
-        # Tenta obter a aba 'Lançamentos' ou cria caso não exista
         try:
             ws = sh.worksheet("Lançamentos")
         except Exception:
             ws = sh.add_worksheet(title="Lançamentos", rows="1000", cols="30")
 
-        # Limpa o conteúdo existente para regravar o histórico sincronizado
+        # Limpa o conteúdo existente para regravar o histórico atualizado
         ws.clear()
 
-        # Trata nulos e converte todo o DataFrame para lista de strings para evitar erro de serialização
+        # Trata nulos e converte para lista de strings
         df_clean = df_lancamentos.copy().fillna("")
         for col in df_clean.columns:
             df_clean[col] = df_clean[col].astype(str)
@@ -229,7 +247,7 @@ USUARIOS = {
     },
     "secretaria": {
         "senha": "123",
-        "nome": "Secretária Recoverty",
+        "nome": "Secretária Recovery",
         "perfil": "Secretária",
         "acesso_financeiro": False,
         "pode_excluir_alterar": False,
@@ -242,8 +260,8 @@ def check_login():
         st.session_state.usuario_logado = None
 
     if st.session_state.usuario_logado is None:
-        st.title("🔐 RECOVERTY — Portal de Acesso")
-        st.caption("Insira suas credenciais para acessar a plataforma.")
+        st.title("🔐 RECOVERY — Portal de Acesso")
+        st.caption("Insira suas credenciais para acessar a plataforma de gestão.")
         
         with st.form("form_login"):
             usuario_input = st.text_input("Usuário").strip().lower()
@@ -354,83 +372,47 @@ if check_login():
     user = st.session_state.usuario_logado
 
     # Sidebar com informações do perfil
-    st.sidebar.title("RECOVERTY")
+    st.sidebar.title("RECOVERY")
+    st.sidebar.caption("Gestão Financeira e Agendamentos")
     st.sidebar.markdown(f'<div class="user-badge">👤 {user["nome"]}<br><small>{user["perfil"]}</small></div>', unsafe_allow_html=True)
     
     if st.sidebar.button("🚪 Sair / Logout"):
         st.session_state.usuario_logado = None
         st.rerun()
 
-    # Definir opções de menu conforme as permissões do perfil
+    # Definir opções de menu conforme permissões do perfil
     if user["acesso_financeiro"]:
-        menu_options = ["📅 Agendamentos", "📊 Dashboard", "➕ Novo Lançamento", "📋 Lançamentos", "⚙️ Parâmetros", "📈 Relatórios"]
+        menu_options = ["📊 Dashboard", "📅 Agendamentos", "➕ Novo Lançamento", "📋 Lançamentos", "⚙️ Parâmetros", "📈 Relatórios"]
     else:
-        menu_options = ["📅 Agendamentos"]
+        menu_options = ["📅 Agendamentos"] # Secretária acessa apenas Agendamentos
 
     menu = st.sidebar.radio("Navegação", menu_options)
 
     # ==========================================================================
-    # MODULO: AGENDAMENTOS (Acesso para Todos)
+    # MODULO: DASHBOARD (Com Card de Diagnóstico das Conexões)
     # ==========================================================================
-    if menu == "📅 Agendamentos":
-        st.markdown('<div class="main-header">Agendamento de Atendimentos</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sub-header">Gestão de horários, pacientes e procedimentos da clínica.</div>', unsafe_allow_html=True)
+    if menu == "📊 Dashboard":
+        st.markdown('<div class="main-header">RECOVERY — Dashboard Financeiro</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub-header">Visão consolidada dos lançamentos ativos e indicadores da clínica.</div>', unsafe_allow_html=True)
 
-        tab_lista, tab_novo = st.tabs(["📋 Agendamentos Marcados", "➕ Novo Agendamento"])
+        # CARD DE DIAGNÓSTICO DE CONEXÃO
+        with st.expander("📡 Status de Conexão e Integrações (Google Drive / Google Sheets)", expanded=False):
+            st_ok, msg_conexao, email_bot = testar_conexao_google_sheets()
+            
+            c_diag1, c_diag2 = st.columns(2)
+            with c_diag1:
+                st.write("**Biblioteca `gspread`:**", "🟢 Instalada" if HAS_GSPREAD else "🔴 Não instalada")
+                st.write("**Secrets `gcp_service_account`:**", "🟢 Configurado" if "gcp_service_account" in st.secrets else "🔴 Ausente")
+            
+            with c_diag2:
+                if st_ok:
+                    st.success(f"🟢 **Google Sheets:** {msg_conexao}")
+                    st.caption(f"E-mail da Service Account conectada: `{email_bot}`")
+                else:
+                    st.error(f"🔴 **Google Sheets:** {msg_conexao}")
+                    st.caption("Verifique se você compartilhou a planilha como 'Editor' com o e-mail: `recoveryagora@recorybianca.iam.gserviceaccount.com`")
 
-        with tab_lista:
-            df_agd = st.session_state.agendamentos
-            if not df_agd.empty:
-                st.dataframe(df_agd, use_container_width=True, hide_index=True)
-            else:
-                st.info("Nenhum agendamento cadastrado.")
-
-        with tab_novo:
-            with st.form("form_novo_agendamento", clear_on_submit=True):
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    agd_data = st.date_input("Data do Atendimento", value=date.today())
-                    agd_hora = st.time_input("Horário", value=time(9, 0))
-                    agd_paciente = st.text_input("Nome do Paciente *")
-                with col2:
-                    procedimentos_lista = list(st.session_state.param_procedimentos["Procedimento"].unique())
-                    agd_procedimento = st.selectbox("Procedimento *", procedimentos_lista)
-                    agd_profissional = st.selectbox("Profissional", st.session_state.param_profissionais)
-                with col3:
-                    agd_telefone = st.text_input("Telefone / WhatsApp", placeholder="(00) 00000-0000")
-                    agd_status = st.selectbox("Status Inicial", ["Agendado", "Confirmado", "Realizado", "Cancelado"])
-
-                agd_obs = st.text_area("Observações do Agendamento", placeholder="Anotações gerais do paciente...")
-
-                if st.form_submit_button("💾 Salvar Agendamento", use_container_width=True):
-                    if not agd_paciente:
-                        st.error("Por favor, preencha o nome do paciente.")
-                    else:
-                        novo_agd_id = f"AGD-{len(st.session_state.agendamentos) + 1:03d}"
-                        novo_agd_rec = {
-                            "ID": novo_agd_id,
-                            "Data": str(agd_data),
-                            "Horário": agd_hora.strftime("%H:%M"),
-                            "Paciente": agd_paciente,
-                            "Procedimento": agd_procedimento,
-                            "Profissional": agd_profissional,
-                            "Telefone": agd_telefone,
-                            "Status": agd_status,
-                            "Observações": agd_obs
-                        }
-                        st.session_state.agendamentos = pd.concat([
-                            st.session_state.agendamentos, pd.DataFrame([novo_agd_rec])
-                        ], ignore_index=True)
-                        st.success(f"Agendamento {novo_agd_id} cadastrado com sucesso!")
-                        st.rerun()
-
-    # ==========================================================================
-    # MODULO: DASHBOARD (Financeiro)
-    # ==========================================================================
-    elif menu == "📊 Dashboard":
-        st.markdown('<div class="main-header">Dashboard Financeiro</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sub-header">Visão consolidada dos lançamentos ativos.</div>', unsafe_allow_html=True)
-
+        # FILTROS
         df_lan_raw = st.session_state.lancamentos.copy()
         df_lan = df_lan_raw[df_lan_raw["STATUS"] == "ATIVO"] if "STATUS" in df_lan_raw.columns else df_lan_raw
 
@@ -491,11 +473,66 @@ if check_login():
                 st.plotly_chart(fig_bar, use_container_width=True)
 
     # ==========================================================================
-    # MODULO: NOVO LANÇAMENTO (Sincronização Ativa com Google Sheets)
+    # MODULO: AGENDAMENTOS
+    # ==========================================================================
+    elif menu == "📅 Agendamentos":
+        st.markdown('<div class="main-header">RECOVERY — Agendamento de Atendimentos</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub-header">Gestão de horários, pacientes e procedimentos da clínica.</div>', unsafe_allow_html=True)
+
+        tab_lista, tab_novo = st.tabs(["📋 Agendamentos Marcados", "➕ Novo Agendamento"])
+
+        with tab_lista:
+            df_agd = st.session_state.agendamentos
+            if not df_agd.empty:
+                st.dataframe(df_agd, use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhum agendamento cadastrado.")
+
+        with tab_novo:
+            with st.form("form_novo_agendamento", clear_on_submit=True):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    agd_data = st.date_input("Data do Atendimento", value=date.today())
+                    agd_hora = st.time_input("Horário", value=time(9, 0))
+                    agd_paciente = st.text_input("Nome do Paciente *")
+                with col2:
+                    procedimentos_lista = list(st.session_state.param_procedimentos["Procedimento"].unique())
+                    agd_procedimento = st.selectbox("Procedimento *", procedimentos_lista)
+                    agd_profissional = st.selectbox("Profissional", st.session_state.param_profissionais)
+                with col3:
+                    agd_telefone = st.text_input("Telefone / WhatsApp", placeholder="(00) 00000-0000")
+                    agd_status = st.selectbox("Status Inicial", ["Agendado", "Confirmado", "Realizado", "Cancelado"])
+
+                agd_obs = st.text_area("Observações do Agendamento", placeholder="Anotações gerais do paciente...")
+
+                if st.form_submit_button("💾 Salvar Agendamento", use_container_width=True):
+                    if not agd_paciente:
+                        st.error("Por favor, preencha o nome do paciente.")
+                    else:
+                        novo_agd_id = f"AGD-{len(st.session_state.agendamentos) + 1:03d}"
+                        novo_agd_rec = {
+                            "ID": novo_agd_id,
+                            "Data": str(agd_data),
+                            "Horário": agd_hora.strftime("%H:%M"),
+                            "Paciente": agd_paciente,
+                            "Procedimento": agd_procedimento,
+                            "Profissional": agd_profissional,
+                            "Telefone": agd_telefone,
+                            "Status": agd_status,
+                            "Observações": agd_obs
+                        }
+                        st.session_state.agendamentos = pd.concat([
+                            st.session_state.agendamentos, pd.DataFrame([novo_agd_rec])
+                        ], ignore_index=True)
+                        st.success(f"Agendamento {novo_agd_id} cadastrado com sucesso!")
+                        st.rerun()
+
+    # ==========================================================================
+    # MODULO: NOVO LANÇAMENTO (Com Sincronização e Feedback)
     # ==========================================================================
     elif menu == "➕ Novo Lançamento":
-        st.markdown('<div class="main-header">Novo Lançamento Financeiro</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sub-header">Registre lançamentos com prévia automatizada e sincronização no Google Sheets.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="main-header">RECOVERY — Novo Lançamento Financeiro</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub-header">Registre lançamentos com prévia automatizada e sincronização na planilha.</div>', unsafe_allow_html=True)
 
         with st.form("form_novo_lancamento", clear_on_submit=True):
             col1, col2, col3 = st.columns(3)
@@ -561,7 +598,7 @@ if check_login():
             pr_col2.write(f"👉 **Clínica c/ Material Total:** {fmt_brl(calc['valor_final_clinica_com_material'])}")
             st.markdown('</div>', unsafe_allow_html=True)
 
-            if st.form_submit_button("💾 Salvar e Enviar para Planilha", use_container_width=True):
+            if st.form_submit_button("💾 Salvar e Sincronizar na Planilha", use_container_width=True):
                 if not paciente:
                     st.error("Por favor, informe o nome do paciente.")
                 elif valor_bruto_inp <= 0:
@@ -607,13 +644,13 @@ if check_login():
                     with st.spinner("Gravando na planilha do Google Sheets..."):
                         synced = sync_to_google_sheets(st.session_state.lancamentos)
                         if synced:
-                            st.success(f"✅ Lançamento {novo_id} gravado com SUCESSO na planilha Google Sheets!")
+                            st.success(f"✅ Lançamento {novo_id} salvo localmente e GRAVADO com sucesso no Google Sheets!")
 
     # ==========================================================================
-    # MODULO: LANÇAMENTOS (Com Histórico e Soft Delete para Auditoria)
+    # MODULO: LANÇAMENTOS
     # ==========================================================================
     elif menu == "📋 Lançamentos":
-        st.markdown('<div class="main-header">Histórico de Lançamentos</div>', unsafe_allow_html=True)
+        st.markdown('<div class="main-header">RECOVERY — Histórico de Lançamentos</div>', unsafe_allow_html=True)
         st.markdown('<div class="sub-header">Consulta completa com controle de auditoria e status do registro.</div>', unsafe_allow_html=True)
 
         df_lan = st.session_state.lancamentos
@@ -645,7 +682,7 @@ if check_login():
                         
                         with st.spinner("Atualizando histórico na planilha..."):
                             sync_to_google_sheets(st.session_state.lancamentos)
-                            st.success(f"Lançamento {sel_del} marcado como EXCLUÍDO e gravado na planilha!")
+                            st.success(f"Lançamento {sel_del} marcado como EXCLUÍDO e atualizado no Google Sheets!")
                             st.rerun()
                 else:
                     st.info("Não há lançamentos ativos para exclusão.")
@@ -658,7 +695,7 @@ if check_login():
     # MODULO: PARÂMETROS
     # ==========================================================================
     elif menu == "⚙️ Parâmetros":
-        st.markdown('<div class="main-header">Parâmetros do Sistema</div>', unsafe_allow_html=True)
+        st.markdown('<div class="main-header">RECOVERY — Parâmetros do Sistema</div>', unsafe_allow_html=True)
         st.markdown('<div class="sub-header">Configuração de taxas, procedimentos e impostos.</div>', unsafe_allow_html=True)
 
         if not user["pode_editar_parametros"]:
@@ -692,7 +729,7 @@ if check_login():
     # MODULO: RELATÓRIOS
     # ==========================================================================
     elif menu == "📈 Relatórios":
-        st.markdown('<div class="main-header">Relatórios Financeiros</div>', unsafe_allow_html=True)
+        st.markdown('<div class="main-header">RECOVERY — Relatórios Financeiros</div>', unsafe_allow_html=True)
         st.markdown('<div class="sub-header">Exportação consolidada dos dados completos.</div>', unsafe_allow_html=True)
 
         df_lan = st.session_state.lancamentos
@@ -700,11 +737,11 @@ if check_login():
             col_exp1, col_exp2 = st.columns(2)
             
             csv_data = df_lan.to_csv(index=False).encode('utf-8')
-            col_exp1.download_button("📥 Baixar Relatório CSV", data=csv_data, file_name=f"relatorio_recoverty_{date.today()}.csv", mime="text/csv", use_container_width=True)
+            col_exp1.download_button("📥 Baixar Relatório CSV", data=csv_data, file_name=f"relatorio_recovery_{date.today()}.csv", mime="text/csv", use_container_width=True)
 
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df_lan.to_excel(writer, index=False, sheet_name='Lançamentos')
-            col_exp2.download_button("📊 Baixar Relatório Excel", data=output.getvalue(), file_name=f"relatorio_recoverty_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            col_exp2.download_button("📊 Baixar Relatório Excel", data=output.getvalue(), file_name=f"relatorio_recovery_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
         else:
             st.info("Não há dados para exportação.")
