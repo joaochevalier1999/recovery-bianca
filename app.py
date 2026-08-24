@@ -45,13 +45,6 @@ st.markdown("""
         border-radius: 6px;
         margin-top: 10px;
     }
-    .status-card {
-        background-color: #F1F5F9;
-        border: 1px solid #CBD5E1;
-        padding: 12px 18px;
-        border-radius: 8px;
-        margin-bottom: 20px;
-    }
     .user-badge {
         background-color: #E2E8F0;
         padding: 6px 12px;
@@ -80,7 +73,7 @@ def get_gspread_client():
 
     try:
         creds_dict = dict(st.secrets["gcp_service_account"])
-        # Garante tratamento para quebras de linha na private_key
+        # Tratamento correto das quebras de linha na chave privada
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
@@ -92,20 +85,20 @@ def get_gspread_client():
         client = gspread.authorize(credentials)
         return client, None
     except Exception as e:
-        return None, f"Erro de Autenticação nas Credenciais: {str(e)}"
+        return None, f"Erro na Chave/Credenciais: {str(e)}"
 
 def testar_conexao_google_sheets():
-    """Testa a conexão e o acesso de escrita na planilha para exibir o diagnóstico no Dashboard."""
+    """Testa a conexão e exibe o detalhe exato do erro caso falhe."""
     client, err_msg = get_gspread_client()
     if err_msg:
         return False, err_msg, None
     
     try:
         sh = client.open_by_key(SPREADSHEET_ID)
-        email_bot = st.secrets["gcp_service_account"].get("client_email", "Email N/A")
+        email_bot = st.secrets["gcp_service_account"].get("client_email", "recoveryagora@recorybianca.iam.gserviceaccount.com")
         return True, f"Conectado com SUCESSO à planilha '{sh.title}'", email_bot
     except Exception as e:
-        return False, f"Erro ao acessar a planilha: {str(e)}", None
+        return False, f"Detalhe do Erro: {type(e).__name__} - {str(e)}", "recoveryagora@recorybianca.iam.gserviceaccount.com"
 
 def sync_to_google_sheets(df_lancamentos):
     """Envia o DataFrame completo de Lançamentos para a aba 'Lançamentos' do Google Sheets."""
@@ -122,10 +115,8 @@ def sync_to_google_sheets(df_lancamentos):
         except Exception:
             ws = sh.add_worksheet(title="Lançamentos", rows="1000", cols="30")
 
-        # Limpa o conteúdo existente para regravar o histórico atualizado
         ws.clear()
 
-        # Trata nulos e converte para lista de strings
         df_clean = df_lancamentos.copy().fillna("")
         for col in df_clean.columns:
             df_clean[col] = df_clean[col].astype(str)
@@ -134,7 +125,7 @@ def sync_to_google_sheets(df_lancamentos):
         ws.update("A1", valores)
         return True
     except Exception as e:
-        st.error(f"❌ Erro ao gravar dados na planilha Google Sheets: {str(e)}")
+        st.error(f"❌ Erro ao regravar planilha Google Sheets: {str(e)}")
         return False
 
 # ==============================================================================
@@ -177,23 +168,18 @@ def calcular_lancamento(
     c_nota = to_decimal(custo_nota_fiscal)
     repasse_pct = to_decimal(percentual_repasse_dra)
 
-    # Taxa de Pagamento
     valor_taxa_pag = quantize_money((v_bruto * (taxa_pct / Decimal("100"))) + taxa_fixa)
     valor_apos_taxa = quantize_money(v_bruto - valor_taxa_pag)
 
-    # Impostos (caso aplicável por alíquota)
     valor_imposto = quantize_money(v_bruto * (imposto_pct / Decimal("100")))
     cost_nf_total = c_nota if c_nota > 0 else valor_imposto
 
-    # Material Total Clínica
     mat_clinica_total = quantize_money(mat_clinica + mat_add)
 
-    # Lucro Líquido
     lucro_liquido = quantize_money(
         valor_apos_taxa - mat_clinica_total - mat_dra - cost_nf_total
     )
 
-    # Divisão/Repasse
     repasse_dra_base = quantize_money(lucro_liquido * (repasse_pct / Decimal("100")))
     valor_final_dra = quantize_money(repasse_dra_base + mat_dra)
     valor_repassado_clinica = quantize_money(lucro_liquido - repasse_dra_base)
@@ -371,7 +357,6 @@ if check_login():
     init_session_state()
     user = st.session_state.usuario_logado
 
-    # Sidebar com informações do perfil
     st.sidebar.title("RECOVERY")
     st.sidebar.caption("Gestão Financeira e Agendamentos")
     st.sidebar.markdown(f'<div class="user-badge">👤 {user["nome"]}<br><small>{user["perfil"]}</small></div>', unsafe_allow_html=True)
@@ -380,23 +365,22 @@ if check_login():
         st.session_state.usuario_logado = None
         st.rerun()
 
-    # Definir opções de menu conforme permissões do perfil
     if user["acesso_financeiro"]:
         menu_options = ["📊 Dashboard", "📅 Agendamentos", "➕ Novo Lançamento", "📋 Lançamentos", "⚙️ Parâmetros", "📈 Relatórios"]
     else:
-        menu_options = ["📅 Agendamentos"] # Secretária acessa apenas Agendamentos
+        menu_options = ["📅 Agendamentos"]
 
     menu = st.sidebar.radio("Navegação", menu_options)
 
     # ==========================================================================
-    # MODULO: DASHBOARD (Com Card de Diagnóstico das Conexões)
+    # MODULO: DASHBOARD
     # ==========================================================================
     if menu == "📊 Dashboard":
         st.markdown('<div class="main-header">RECOVERY — Dashboard Financeiro</div>', unsafe_allow_html=True)
         st.markdown('<div class="sub-header">Visão consolidada dos lançamentos ativos e indicadores da clínica.</div>', unsafe_allow_html=True)
 
-        # CARD DE DIAGNÓSTICO DE CONEXÃO
-        with st.expander("📡 Status de Conexão e Integrações (Google Drive / Google Sheets)", expanded=False):
+        # DIAGNÓSTICO DE CONEXÃO DETALHADO
+        with st.expander("📡 Status de Conexão e Integrações (Google Drive / Google Sheets)", expanded=True):
             st_ok, msg_conexao, email_bot = testar_conexao_google_sheets()
             
             c_diag1, c_diag2 = st.columns(2)
@@ -407,10 +391,10 @@ if check_login():
             with c_diag2:
                 if st_ok:
                     st.success(f"🟢 **Google Sheets:** {msg_conexao}")
-                    st.caption(f"E-mail da Service Account conectada: `{email_bot}`")
+                    st.caption(f"E-mail da Service Account em uso: `{email_bot}`")
                 else:
                     st.error(f"🔴 **Google Sheets:** {msg_conexao}")
-                    st.caption("Verifique se você compartilhou a planilha como 'Editor' com o e-mail: `recoveryagora@recorybianca.iam.gserviceaccount.com`")
+                    st.warning(f"👉 Ação requerida: Abra a planilha e adicione o e-mail `{email_bot}` como 'Editor' nas opções de Compartilhar.")
 
         # FILTROS
         df_lan_raw = st.session_state.lancamentos.copy()
@@ -528,7 +512,7 @@ if check_login():
                         st.rerun()
 
     # ==========================================================================
-    # MODULO: NOVO LANÇAMENTO (Com Sincronização e Feedback)
+    # MODULO: NOVO LANÇAMENTO
     # ==========================================================================
     elif menu == "➕ Novo Lançamento":
         st.markdown('<div class="main-header">RECOVERY — Novo Lançamento Financeiro</div>', unsafe_allow_html=True)
@@ -563,7 +547,6 @@ if check_login():
 
             observacoes_inp = st.text_area("Observações do Lançamento", placeholder="Detalhes opcionais sobre este atendimento...")
 
-            # Cálculo de prévia
             taxa_pct_lookup = st.session_state.param_taxas.loc[
                 st.session_state.param_taxas["Forma de Pagamento"] == forma_pag_sel, "Taxa (%)"
             ].values
@@ -640,7 +623,6 @@ if check_login():
                         st.session_state.lancamentos, pd.DataFrame([novo_registro])
                     ], ignore_index=True)
 
-                    # Enviar para o Google Sheets
                     with st.spinner("Gravando na planilha do Google Sheets..."):
                         synced = sync_to_google_sheets(st.session_state.lancamentos)
                         if synced:
@@ -675,7 +657,6 @@ if check_login():
                     if st.button("Confirmar Exclusão e Atualizar Planilha", type="primary"):
                         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         
-                        # Atualiza o status e salva o histórico em vez de apagar
                         st.session_state.lancamentos.loc[
                             st.session_state.lancamentos["ID"] == sel_del, ["STATUS", "EXCLUIDO EM", "USUARIO EXCLUSAO"]
                         ] = ["EXCLUÍDO", now_str, user["nome"]]
